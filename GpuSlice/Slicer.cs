@@ -1,6 +1,9 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using Unity.Collections;          // fixes NativeArray<>
+using UnityEngine.Rendering;       // fixes VertexAttribute enum
+
 
 namespace EzySlice {
 
@@ -130,127 +133,122 @@ namespace EzySlice {
          * Returns null if no intersection has been found or the GameObject does not contain
          * a valid mesh to cut.
          */
-        public static SlicedHull Slice(Mesh sharedMesh, Plane pl, TextureRegion region, int crossIndex) {
-            if (sharedMesh == null) {
-                return null;
-            }
-
-            Vector3[] verts = sharedMesh.vertices;
-            Vector2[] uv = sharedMesh.uv;
-            Vector3[] norm = sharedMesh.normals;
-            Vector4[] tan = sharedMesh.tangents;
+         public static SlicedHull Slice(
+                Mesh            sharedMesh,
+                Plane           pl,
+                TextureRegion   region,
+                int             crossIndex)
+        {
+            if (sharedMesh == null) return null;
 
             int submeshCount = sharedMesh.subMeshCount;
+            var slices      = new SlicedSubmesh[submeshCount];
+            var crossHull   = new List<Vector3>();
 
-            // each submesh will be sliced and placed in its own array structure
-            SlicedSubmesh[] slices = new SlicedSubmesh[submeshCount];
-            // the cross section hull is common across all submeshes
-            List<Vector3> crossHull = new List<Vector3>();
+            // — feature flags (GPU path or CPU fallback) ----------------------------
+            bool useGpu  = GPUSlicer.SliceShader != null && SystemInfo.supportsComputeShaders;
+            bool genUV   = sharedMesh.HasVertexAttribute(VertexAttribute.TexCoord0);
+            bool genNor  = sharedMesh.HasVertexAttribute(VertexAttribute.Normal);
+            bool genTan  = sharedMesh.HasVertexAttribute(VertexAttribute.Tangent);
 
-            // we reuse this object for all intersection tests
+            // useGpu = false;
+
+            // — slice each sub‑mesh --------------------------------------------------
+            for (int sm = 0; sm < submeshCount; ++sm)
+            {
+                if (useGpu)
+                {
+                    List<Vector3> subCross;
+                    slices[sm] = GPUSlicer.SliceSubmesh(sharedMesh, pl, out subCross, sm);
+                    crossHull.AddRange(subCross);
+                }
+                else
+                {
+                    slices[sm] = SliceSubmeshCPU(sharedMesh, sm, pl, genUV, genNor, genTan, crossHull);
+                }
+            }
+
+            // — total up triangle counts for array sizing ---------------------------
+            int upperTotal = 0, lowerTotal = 0;
+            bool anyValid  = false;
+
+            for (int i = 0; i < slices.Length; ++i)
+            {
+                if (slices[i] == null) continue;
+                upperTotal += slices[i].upperHull.Count;
+                lowerTotal += slices[i].lowerHull.Count;
+                anyValid   |= slices[i].isValid;
+            }
+
+            if (!anyValid)               // plane missed the mesh entirely
+                return null;
+
+            // — build cap & final meshes -------------------------------------------
+            List<Triangle> crossSection = CreateFrom(crossHull, pl.normal, region);
+
+            Mesh upperMesh = CreateUpperHull(slices, upperTotal, crossSection, crossIndex);
+            Mesh lowerMesh = CreateLowerHull(slices, lowerTotal, crossSection, crossIndex);
+
+            return new SlicedHull(upperMesh, lowerMesh);
+        }
+
+        // CPU fallback slicing for a submesh (similar logic to original Slicer for one submesh).
+        private static SlicedSubmesh SliceSubmeshCPU(Mesh mesh, int submeshIndex, Plane pl, bool genUV, bool genNorm, bool genTan, List<Vector3> crossHull) {
+            Vector3[] verts = mesh.vertices;
+            Vector2[] uvs = genUV ? mesh.uv : null;
+            Vector3[] norms = genNorm ? mesh.normals : null;
+            Vector4[] tans = genTan ? mesh.tangents : null;
+
+            int[] indices = mesh.GetTriangles(submeshIndex);
+            SlicedSubmesh slice = new SlicedSubmesh();
             IntersectionResult result = new IntersectionResult();
 
-            // see if we would like to split the mesh using uv, normals and tangents
-            bool genUV = verts.Length == uv.Length;
-            bool genNorm = verts.Length == norm.Length;
-            bool genTan = verts.Length == tan.Length;
+            for (int i = 0; i < indices.Length; i += 3) {
+                int i0 = indices[i];
+                int i1 = indices[i + 1];
+                int i2 = indices[i + 2];
+                Triangle tri = new Triangle(verts[i0], verts[i1], verts[i2]);
+                if (genUV) tri.SetUV(uvs[i0], uvs[i1], uvs[i2]);
+                if (genNorm) tri.SetNormal(norms[i0], norms[i1], norms[i2]);
+                if (genTan) tri.SetTangent(tans[i0], tans[i1], tans[i2]);
 
-            // iterate over all the submeshes individually. vertices and indices
-            // are all shared within the submesh
-            for (int submesh = 0; submesh < submeshCount; submesh++) {
-                int[] indices = sharedMesh.GetTriangles(submesh);
-                int indicesCount = indices.Length;
-
-                SlicedSubmesh mesh = new SlicedSubmesh();
-
-                // loop through all the mesh vertices, generating upper and lower hulls
-                // and all intersection points
-                for (int index = 0; index < indicesCount; index += 3) {
-                    int i0 = indices[index + 0];
-                    int i1 = indices[index + 1];
-                    int i2 = indices[index + 2];
-
-                    Triangle newTri = new Triangle(verts[i0], verts[i1], verts[i2]);
-
-                    // generate UV if available
-                    if (genUV) {
-                        newTri.SetUV(uv[i0], uv[i1], uv[i2]);
+                if (tri.Split(pl, result)) {
+                    // Triangle was cut by plane - add resulting hull triangles and intersection points
+                    int upperCount = result.upperHullCount;
+                    int lowerCount = result.lowerHullCount;
+                    int interCount = result.intersectionPointCount;
+                    for (int j = 0; j < upperCount; j++) {
+                        slice.upperHull.Add(result.upperHull[j]);
                     }
-
-                    // generate normals if available
-                    if (genNorm) {
-                        newTri.SetNormal(norm[i0], norm[i1], norm[i2]);
+                    for (int j = 0; j < lowerCount; j++) {
+                        slice.lowerHull.Add(result.lowerHull[j]);
                     }
-
-                    // generate tangents if available
-                    if (genTan) {
-                        newTri.SetTangent(tan[i0], tan[i1], tan[i2]);
+                    for (int j = 0; j < interCount; j++) {
+                        crossHull.Add(result.intersectionPoints[j]);
                     }
-
-                    // slice this particular triangle with the provided
-                    // plane
-                    if (newTri.Split(pl, result)) {
-                        int upperHullCount = result.upperHullCount;
-                        int lowerHullCount = result.lowerHullCount;
-                        int interHullCount = result.intersectionPointCount;
-
-                        for (int i = 0; i < upperHullCount; i++) {
-                            mesh.upperHull.Add(result.upperHull[i]);
-                        }
-
-                        for (int i = 0; i < lowerHullCount; i++) {
-                            mesh.lowerHull.Add(result.lowerHull[i]);
-                        }
-
-                        for (int i = 0; i < interHullCount; i++) {
-                            crossHull.Add(result.intersectionPoints[i]);
-                        }
+                } else {
+                    // Not cut: classify whole triangle to one side
+                    SideOfPlane sa = pl.SideOf(verts[i0]);
+                    SideOfPlane sb = pl.SideOf(verts[i1]);
+                    SideOfPlane sc = pl.SideOf(verts[i2]);
+                    SideOfPlane side = SideOfPlane.ON;
+                    if (sa != SideOfPlane.ON) side = sa;
+                    if (sb != SideOfPlane.ON) {
+                        Debug.Assert(side == SideOfPlane.ON || side == sb);
+                        side = sb;
+                    }
+                    if (sc != SideOfPlane.ON) {
+                        Debug.Assert(side == SideOfPlane.ON || side == sc);
+                        side = sc;
+                    }
+                    if (side == SideOfPlane.UP || side == SideOfPlane.ON) {
+                        slice.upperHull.Add(tri);
                     } else {
-                        SideOfPlane sa = pl.SideOf(verts[i0]);
-                        SideOfPlane sb = pl.SideOf(verts[i1]);
-                        SideOfPlane sc = pl.SideOf(verts[i2]);
-
-                        SideOfPlane side = SideOfPlane.ON;
-                        if (sa != SideOfPlane.ON)
-                        {
-                            side = sa;
-                        }
-                        
-                        if (sb != SideOfPlane.ON)
-                        {
-                            Debug.Assert(side == SideOfPlane.ON || side == sb);
-                            side = sb;
-                        }
-                        
-                        if (sc != SideOfPlane.ON)
-                        {
-                            Debug.Assert(side == SideOfPlane.ON || side == sc);
-                            side = sc;
-                        }
-
-                        if (side == SideOfPlane.UP || side == SideOfPlane.ON) {
-                            mesh.upperHull.Add(newTri);
-                        } else {
-                            mesh.lowerHull.Add(newTri);
-                        }
+                        slice.lowerHull.Add(tri);
                     }
                 }
-
-                // register into the index
-                slices[submesh] = mesh;
             }
-
-            // check if slicing actually occured
-            for (int i = 0; i < slices.Length; i++) {
-                // check if at least one of the submeshes was sliced. If so, stop checking
-                // because we need to go through the generation step
-                if (slices[i] != null && slices[i].isValid) {
-                    return CreateFrom(slices, CreateFrom(crossHull, pl.normal, region), crossIndex);
-                }
-            }
-
-            // no slicing occured, just return null to signify
-            return null;
+            return slice;
         }
 
         /**

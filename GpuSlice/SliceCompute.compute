@@ -1,0 +1,598 @@
+// SliceCompute.compute - Compute shader for GPU-accelerated slicing
+
+// Defines two kernels: ClassifyTris and SplitIntersecting
+#pragma kernel ClassifyTris
+#pragma kernel SplitIntersecting
+
+// Struct definitions matching those in GPUSlicer (with appropriate HLSL types and alignment).
+struct PackedVertex {
+    float3 pos;
+    float3 norm;
+    float2 uv;
+    float4 tan;
+};
+
+struct VertexOut {
+    float4 pos;
+    float4 norm;
+    float4 uv;
+    float4 tan;
+};
+
+struct TriangleOut {
+    VertexOut v0;
+    VertexOut v1;
+    VertexOut v2;
+};
+
+// Buffers and uniforms (set in C# code)
+StructuredBuffer<PackedVertex> _Vertices;
+StructuredBuffer<int> _Indices;
+RWStructuredBuffer<int> _Classification;          // Output classification flags per triangle (0=below,1=above,2=intersect)
+
+AppendStructuredBuffer<int> _IntersectAppend; // write in ClassifyTris
+StructuredBuffer<int>       _IntersectRead; // read in SplitIntersecting
+
+// Uniforms for plane and counts
+float3 _PlaneNormal;
+float _PlaneDist;
+int _NumTriangles;
+
+// Buffers for second kernel
+// StructuredBuffer<int> _IntersectedTriangles;  // Input list of intersecting triangle indices
+AppendStructuredBuffer<TriangleOut> _UpperHullTriangles;
+AppendStructuredBuffer<TriangleOut> _LowerHullTriangles;
+AppendStructuredBuffer<float3> _IntersectionPoints;
+
+// Second pass uniforms
+int _NumIntersectTriangles;
+bool _HasUV;
+bool _HasNormal;
+bool _HasTangent;
+
+// Epsilon for plane comparisons (to categorize points as on-plane if within tolerance)
+#define EPSILON 1e-6
+
+void WriteFullTri(out TriangleOut tri, uint ia, uint ib, uint ic)
+{
+    PackedVertex A = _Vertices[ia];
+    PackedVertex B = _Vertices[ib];
+    PackedVertex C = _Vertices[ic];
+
+    tri.v0.pos = float4(A.pos,1);  tri.v1.pos = float4(B.pos,1);  tri.v2.pos = float4(C.pos,1);
+    tri.v0.uv  = float4(A.uv,0,0); tri.v1.uv  = float4(B.uv,0,0); tri.v2.uv  = float4(C.uv,0,0);
+    tri.v0.norm= float4(A.norm,0); tri.v1.norm= float4(B.norm,0); tri.v2.norm= float4(C.norm,0);
+    tri.v0.tan = A.tan;            tri.v1.tan = B.tan;            tri.v2.tan = C.tan;
+}
+
+
+[numthreads(64,1,1)]
+void ClassifyTris(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
+    uint globalIndex = groupId.x * 64 + groupThreadId.x;
+    if (globalIndex >= _NumTriangles) return;
+
+    // Each triangle is defined by three consecutive indices in the _Indices buffer
+    uint i0 = _Indices[globalIndex * 3 + 0];
+    uint i1 = _Indices[globalIndex * 3 + 1];
+    uint i2 = _Indices[globalIndex * 3 + 2];
+
+    // Fetch positions of the triangle's vertices
+    float3 p0 = _Vertices[i0].pos;
+    float3 p1 = _Vertices[i1].pos;
+    float3 p2 = _Vertices[i2].pos;
+
+    // Compute signed distance from plane for each vertex
+    float d0 = dot(_PlaneNormal, p0) - _PlaneDist;
+    float d1 = dot(_PlaneNormal, p1) - _PlaneDist;
+    float d2 = dot(_PlaneNormal, p2) - _PlaneDist;
+
+    bool above0 = d0 > EPSILON;
+    bool above1 = d1 > EPSILON;
+    bool above2 = d2 > EPSILON;
+    bool below0 = d0 < -EPSILON;
+    bool below1 = d1 < -EPSILON;
+    bool below2 = d2 < -EPSILON;
+
+    // Determine triangle classification based on vertices' sides
+    if (!below0 && !below1 && !below2) {
+        TriangleOut tri;
+        WriteFullTri(tri, i0, i1, i2);      // helper fills v0/v1/v2
+        _UpperHullTriangles.Append(tri);
+        // All vertices are either above or on the plane -> treat triangle as upper hull
+        _Classification[globalIndex] = 1;
+    } else if (!above0 && !above1 && !above2) {
+        TriangleOut tri;
+        WriteFullTri(tri, i0, i1, i2);
+        _LowerHullTriangles.Append(tri);
+        // All vertices are either below or on the plane -> treat triangle as lower hull
+        _Classification[globalIndex] = -1;
+    } else {
+        // Triangle spans the plane (at least one vertex on each side) -> mark as intersecting
+        _Classification[globalIndex] = 0;
+        // Append this triangle index to the list of intersecting triangles for further processing
+        _IntersectAppend.Append(globalIndex);
+    }
+}
+
+// --- keeps new triangle winding consistent with the original ---
+void PreserveWinding(inout TriangleOut t, float3 origCross)
+{
+    float3 newCross = cross(t.v1.pos.xyz - t.v0.pos.xyz,
+                            t.v2.pos.xyz - t.v0.pos.xyz);
+
+    // If the new face is flipped w.r.t. the original, swap v1‑v2
+    if (dot(newCross, origCross) < 0.0f)
+    {
+        VertexOut tmp = t.v1;
+        t.v1 = t.v2;
+        t.v2 = tmp;
+    }
+}
+
+[numthreads(64,1,1)]
+void SplitIntersecting(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
+    uint globalIndex = groupId.x * 64 + groupThreadId.x;
+    if (globalIndex >= _NumIntersectTriangles) return;
+
+    // Fetch the triangle index from the list of intersecting triangles
+    uint triIndex = _IntersectRead[globalIndex];
+    // Get original indices of that triangle's vertices
+    uint i0 = _Indices[triIndex * 3 + 0];
+    uint i1 = _Indices[triIndex * 3 + 1];
+    uint i2 = _Indices[triIndex * 3 + 2];
+
+    // Load the original vertex data for each corner of the triangle
+    PackedVertex v0 = _Vertices[i0];
+    PackedVertex v1 = _Vertices[i1];
+    PackedVertex v2 = _Vertices[i2];
+
+    float3 origCross = cross(v1.pos - v0.pos, v2.pos - v0.pos);
+
+    // Compute distances of each vertex to plane (reuse plane normal and dist)
+    float d0 = dot(_PlaneNormal, v0.pos) - _PlaneDist;
+    float d1 = dot(_PlaneNormal, v1.pos) - _PlaneDist;
+    float d2 = dot(_PlaneNormal, v2.pos) - _PlaneDist;
+
+    bool isAbove0 = d0 > EPSILON;
+    bool isAbove1 = d1 > EPSILON;
+    bool isAbove2 = d2 > EPSILON;
+    bool isBelow0 = d0 < -EPSILON;
+    bool isBelow1 = d1 < -EPSILON;
+    bool isBelow2 = d2 < -EPSILON;
+    bool isOn0 = !isAbove0 && !isBelow0;
+    bool isOn1 = !isAbove1 && !isBelow1;
+    bool isOn2 = !isAbove2 && !isBelow2;
+
+    // Count how many vertices are on each side of the plane
+    uint aboveCount = (uint)(isAbove0) + (uint)(isAbove1) + (uint)(isAbove2);
+    uint belowCount = (uint)(isBelow0) + (uint)(isBelow1) + (uint)(isBelow2);
+    // Identify which vertices are on the plane
+    uint onCount = (uint)(isOn0) + (uint)(isOn1) + (uint)(isOn2);
+
+    // Prepare containers for original vertices categorized by side
+    PackedVertex aboveVert1;
+    PackedVertex aboveVert2;
+    PackedVertex belowVert1;
+    PackedVertex belowVert2;
+    PackedVertex onVert;
+
+    // Intersection points (to be computed)
+    VertexOut P;
+    VertexOut Q;
+
+    // We will fill P and Q for new intersection vertices as needed, and output Triangles accordingly
+    if (aboveCount == 2 && belowCount == 1) {
+        // Two vertices above, one below the plane
+        // Identify which is the below vertex and which are above
+        PackedVertex belowVert;
+        PackedVertex aVert1;
+        PackedVertex aVert2;
+        float dBelow, dA1, dA2;
+        if (isBelow0) {
+            belowVert = v0; dBelow = d0;
+            aVert1 = v1; dA1 = d1;
+            aVert2 = v2; dA2 = d2;
+        } else if (isBelow1) {
+            belowVert = v1; dBelow = d1;
+            aVert1 = v0; dA1 = d0;
+            aVert2 = v2; dA2 = d2;
+        } else {
+            belowVert = v2; dBelow = d2;
+            aVert1 = v0; dA1 = d0;
+            aVert2 = v1; dA2 = d1;
+        }
+        // Compute intersection points P and Q on the two crossing edges (below->above1, below->above2)
+        float t1 = dBelow / (dBelow - dA1); // fraction from belowVert to aVert1
+        float t2 = dBelow / (dBelow - dA2); // fraction from belowVert to aVert2
+        // Compute vertex P on edge (belowVert -> aVert1)
+        P.pos = float4(lerp(belowVert.pos, aVert1.pos, t1), 1.0f);
+        // Compute UV, normals, tangents for P by linear interpolation
+        if (_HasUV) {
+            float2 uv_interp = lerp(belowVert.uv, aVert1.uv, t1);
+            P.uv = float4(uv_interp.x, uv_interp.y, 0.0f, 0.0f);
+        } else {
+            P.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            float3 n_interp = normalize(lerp(belowVert.norm, aVert1.norm, t1));
+            P.norm = float4(n_interp, 0.0f);
+        } else {
+            P.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            float3 t_interp = normalize(lerp(belowVert.tan.xyz, aVert1.tan.xyz, t1));
+            // Determine handedness (w) by choosing from closer vertex
+            float hand = (t1 < 0.5) ? belowVert.tan.w : aVert1.tan.w;
+            P.tan = float4(t_interp, hand);
+        } else {
+            P.tan = float4(0,0,0,0);
+        }
+        // Compute vertex Q on edge (belowVert -> aVert2)
+        Q.pos = float4(lerp(belowVert.pos, aVert2.pos, t2), 1.0f);
+        if (_HasUV) {
+            float2 uv_interp2 = lerp(belowVert.uv, aVert2.uv, t2);
+            Q.uv = float4(uv_interp2.x, uv_interp2.y, 0.0f, 0.0f);
+        } else {
+            Q.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            float3 n_interp2 = normalize(lerp(belowVert.norm, aVert2.norm, t2));
+            Q.norm = float4(n_interp2, 0.0f);
+        } else {
+            Q.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            float3 t_interp2 = normalize(lerp(belowVert.tan.xyz, aVert2.tan.xyz, t2));
+            float hand2 = (t2 < 0.5) ? belowVert.tan.w : aVert2.tan.w;
+            Q.tan = float4(t_interp2, hand2);
+        } else {
+            Q.tan = float4(0,0,0,0);
+        }
+        // Output new triangles:
+        // Upper hull: two triangles (aVert1, aVert2, Q) and (aVert1, Q, P)
+        TriangleOut triUp1;
+        triUp1.v0.pos = float4(aVert1.pos, 1.0f);
+        triUp1.v1.pos = float4(aVert2.pos, 1.0f);
+        triUp1.v2.pos = Q.pos;
+        // Interpolate and assign UV/normal/tangent for triUp1 vertices
+        if (_HasUV) {
+            triUp1.v0.uv = float4(aVert1.uv.x, aVert1.uv.y, 0, 0);
+            triUp1.v1.uv = float4(aVert2.uv.x, aVert2.uv.y, 0, 0);
+            triUp1.v2.uv = Q.uv;
+        } else {
+            triUp1.v0.uv = triUp1.v1.uv = triUp1.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triUp1.v0.norm = float4(aVert1.norm, 0);
+            triUp1.v1.norm = float4(aVert2.norm, 0);
+            triUp1.v2.norm = Q.norm;
+        } else {
+            triUp1.v0.norm = triUp1.v1.norm = triUp1.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triUp1.v0.tan = float4(aVert1.tan.xyz, aVert1.tan.w);
+            triUp1.v1.tan = float4(aVert2.tan.xyz, aVert2.tan.w);
+            triUp1.v2.tan = Q.tan;
+        } else {
+            triUp1.v0.tan = triUp1.v1.tan = triUp1.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triUp1, origCross);
+        _UpperHullTriangles.Append(triUp1);
+
+        TriangleOut triUp2;
+        triUp2.v0.pos = float4(aVert1.pos, 1.0f);
+        triUp2.v1.pos = Q.pos;
+        triUp2.v2.pos = P.pos;
+        if (_HasUV) {
+            triUp2.v0.uv = float4(aVert1.uv.x, aVert1.uv.y, 0, 0);
+            triUp2.v1.uv = Q.uv;
+            triUp2.v2.uv = P.uv;
+        } else {
+            triUp2.v0.uv = triUp2.v1.uv = triUp2.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triUp2.v0.norm = float4(aVert1.norm, 0);
+            triUp2.v1.norm = Q.norm;
+            triUp2.v2.norm = P.norm;
+        } else {
+            triUp2.v0.norm = triUp2.v1.norm = triUp2.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triUp2.v0.tan = float4(aVert1.tan.xyz, aVert1.tan.w);
+            triUp2.v1.tan = Q.tan;
+            triUp2.v2.tan = P.tan;
+        } else {
+            triUp2.v0.tan = triUp2.v1.tan = triUp2.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triUp2, origCross);
+        _UpperHullTriangles.Append(triUp2);
+
+        // Lower hull: one triangle (belowVert, P, Q)
+        TriangleOut triLow;
+        triLow.v0.pos = float4(belowVert.pos, 1.0f);
+        triLow.v1.pos = P.pos;
+        triLow.v2.pos = Q.pos;
+        if (_HasUV) {
+            triLow.v0.uv = float4(belowVert.uv.x, belowVert.uv.y, 0, 0);
+            triLow.v1.uv = P.uv;
+            triLow.v2.uv = Q.uv;
+        } else {
+            triLow.v0.uv = triLow.v1.uv = triLow.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triLow.v0.norm = float4(belowVert.norm, 0);
+            triLow.v1.norm = P.norm;
+            triLow.v2.norm = Q.norm;
+        } else {
+            triLow.v0.norm = triLow.v1.norm = triLow.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triLow.v0.tan = float4(belowVert.tan.xyz, belowVert.tan.w);
+            triLow.v1.tan = P.tan;
+            triLow.v2.tan = Q.tan;
+        } else {
+            triLow.v0.tan = triLow.v1.tan = triLow.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triLow, origCross);
+        _LowerHullTriangles.Append(triLow);
+
+        // Append the new intersection points P and Q to the intersection point list for cap generation
+        _IntersectionPoints.Append(P.pos.xyz);
+        _IntersectionPoints.Append(Q.pos.xyz);
+
+    } else if (aboveCount == 1 && belowCount == 2) {
+        // One vertex above, two below
+        // Identify above vertex and two below vertices
+        PackedVertex aboveVert;
+        PackedVertex bVert1;
+        PackedVertex bVert2;
+        float dAbove, dB1, dB2;
+        if (isAbove0) {
+            aboveVert = v0; dAbove = d0;
+            bVert1 = v1; dB1 = d1;
+            bVert2 = v2; dB2 = d2;
+        } else if (isAbove1) {
+            aboveVert = v1; dAbove = d1;
+            bVert1 = v0; dB1 = d0;
+            bVert2 = v2; dB2 = d2;
+        } else {
+            aboveVert = v2; dAbove = d2;
+            bVert1 = v0; dB1 = d0;
+            bVert2 = v1; dB2 = d1;
+        }
+        // Compute intersection points P and Q on edges (aboveVert->bVert1) and (aboveVert->bVert2)
+        float t1 = dAbove / (dAbove - dB1);
+        float t2 = dAbove / (dAbove - dB2);
+        // P on (aboveVert -> bVert1)
+        P.pos = float4(lerp(aboveVert.pos, bVert1.pos, t1), 1.0f);
+        if (_HasUV) {
+            float2 uv_interp = lerp(aboveVert.uv, bVert1.uv, t1);
+            P.uv = float4(uv_interp.x, uv_interp.y, 0, 0);
+        } else {
+            P.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            float3 n_interp = normalize(lerp(aboveVert.norm, bVert1.norm, t1));
+            P.norm = float4(n_interp, 0);
+        } else {
+            P.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            float3 t_interp = normalize(lerp(aboveVert.tan.xyz, bVert1.tan.xyz, t1));
+            float hand = (t1 < 0.5) ? aboveVert.tan.w : bVert1.tan.w;
+            P.tan = float4(t_interp, hand);
+        } else {
+            P.tan = float4(0,0,0,0);
+        }
+        // Q on (aboveVert -> bVert2)
+        Q.pos = float4(lerp(aboveVert.pos, bVert2.pos, t2), 1.0f);
+        if (_HasUV) {
+            float2 uv_interp2 = lerp(aboveVert.uv, bVert2.uv, t2);
+            Q.uv = float4(uv_interp2.x, uv_interp2.y, 0, 0);
+        } else {
+            Q.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            float3 n_interp2 = normalize(lerp(aboveVert.norm, bVert2.norm, t2));
+            Q.norm = float4(n_interp2, 0);
+        } else {
+            Q.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            float3 t_interp2 = normalize(lerp(aboveVert.tan.xyz, bVert2.tan.xyz, t2));
+            float hand2 = (t2 < 0.5) ? aboveVert.tan.w : bVert2.tan.w;
+            Q.tan = float4(t_interp2, hand2);
+        } else {
+            Q.tan = float4(0,0,0,0);
+        }
+        // Upper hull: one triangle (aboveVert, P, Q)
+        TriangleOut triUp;
+        triUp.v0.pos = float4(aboveVert.pos, 1.0f);
+        triUp.v1.pos = P.pos;
+        triUp.v2.pos = Q.pos;
+        if (_HasUV) {
+            triUp.v0.uv = float4(aboveVert.uv.x, aboveVert.uv.y, 0, 0);
+            triUp.v1.uv = P.uv;
+            triUp.v2.uv = Q.uv;
+        } else {
+            triUp.v0.uv = triUp.v1.uv = triUp.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triUp.v0.norm = float4(aboveVert.norm, 0);
+            triUp.v1.norm = P.norm;
+            triUp.v2.norm = Q.norm;
+        } else {
+            triUp.v0.norm = triUp.v1.norm = triUp.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triUp.v0.tan = float4(aboveVert.tan.xyz, aboveVert.tan.w);
+            triUp.v1.tan = P.tan;
+            triUp.v2.tan = Q.tan;
+        } else {
+            triUp.v0.tan = triUp.v1.tan = triUp.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triUp, origCross);
+        _UpperHullTriangles.Append(triUp);
+        // Lower hull: two triangles (bVert1, bVert2, Q) and (bVert1, Q, P)
+        TriangleOut triLow1;
+        triLow1.v0.pos = float4(bVert1.pos, 1.0f);
+        triLow1.v1.pos = float4(bVert2.pos, 1.0f);
+        triLow1.v2.pos = Q.pos;
+        if (_HasUV) {
+            triLow1.v0.uv = float4(bVert1.uv.x, bVert1.uv.y, 0, 0);
+            triLow1.v1.uv = float4(bVert2.uv.x, bVert2.uv.y, 0, 0);
+            triLow1.v2.uv = Q.uv;
+        } else {
+            triLow1.v0.uv = triLow1.v1.uv = triLow1.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triLow1.v0.norm = float4(bVert1.norm, 0);
+            triLow1.v1.norm = float4(bVert2.norm, 0);
+            triLow1.v2.norm = Q.norm;
+        } else {
+            triLow1.v0.norm = triLow1.v1.norm = triLow1.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triLow1.v0.tan = float4(bVert1.tan.xyz, bVert1.tan.w);
+            triLow1.v1.tan = float4(bVert2.tan.xyz, bVert2.tan.w);
+            triLow1.v2.tan = Q.tan;
+        } else {
+            triLow1.v0.tan = triLow1.v1.tan = triLow1.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triLow1, origCross);
+        _LowerHullTriangles.Append(triLow1);
+
+        TriangleOut triLow2;
+        triLow2.v0.pos = float4(bVert1.pos, 1.0f);
+        triLow2.v1.pos = Q.pos;
+        triLow2.v2.pos = P.pos;
+        if (_HasUV) {
+            triLow2.v0.uv = float4(bVert1.uv.x, bVert1.uv.y, 0, 0);
+            triLow2.v1.uv = Q.uv;
+            triLow2.v2.uv = P.uv;
+        } else {
+            triLow2.v0.uv = triLow2.v1.uv = triLow2.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triLow2.v0.norm = float4(bVert1.norm, 0);
+            triLow2.v1.norm = Q.norm;
+            triLow2.v2.norm = P.norm;
+        } else {
+            triLow2.v0.norm = triLow2.v1.norm = triLow2.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triLow2.v0.tan = float4(bVert1.tan.xyz, bVert1.tan.w);
+            triLow2.v1.tan = Q.tan;
+            triLow2.v2.tan = P.tan;
+        } else {
+            triLow2.v0.tan = triLow2.v1.tan = triLow2.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triLow2, origCross);
+        _LowerHullTriangles.Append(triLow2);
+
+        // Append intersection points P and Q
+        _IntersectionPoints.Append(P.pos.xyz);
+        _IntersectionPoints.Append(Q.pos.xyz);
+
+    } else if (aboveCount == 1 && belowCount == 1 && onCount == 1) {
+        // One vertex exactly on the plane, one above, one below
+        PackedVertex onVertex;
+        PackedVertex aVert;
+        PackedVertex bVert;
+        float dA, dB;
+        if (isOn0) {
+            onVertex = v0;
+            if (isAbove1) { aVert = v1; dA = d1; bVert = v2; dB = d2; }
+            else { aVert = v2; dA = d2; bVert = v1; dB = d1; }
+        } else if (isOn1) {
+            onVertex = v1;
+            if (isAbove0) { aVert = v0; dA = d0; bVert = v2; dB = d2; }
+            else { aVert = v2; dA = d2; bVert = v0; dB = d0; }
+        } else {
+            onVertex = v2;
+            if (isAbove0) { aVert = v0; dA = d0; bVert = v1; dB = d1; }
+            else { aVert = v1; dA = d1; bVert = v0; dB = d0; }
+        }
+        // Compute intersection point P on edge (aVert -> bVert)
+        float t = dA / (dA - dB);
+        P.pos = float4(lerp(aVert.pos, bVert.pos, t), 1.0f);
+        if (_HasUV) {
+            float2 uv_interp = lerp(aVert.uv, bVert.uv, t);
+            P.uv = float4(uv_interp.x, uv_interp.y, 0, 0);
+        } else {
+            P.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            float3 n_interp = normalize(lerp(aVert.norm, bVert.norm, t));
+            P.norm = float4(n_interp, 0);
+        } else {
+            P.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            float3 t_interp = normalize(lerp(aVert.tan.xyz, bVert.tan.xyz, t));
+            float hand = (t < 0.5) ? aVert.tan.w : bVert.tan.w;
+            P.tan = float4(t_interp, hand);
+        } else {
+            P.tan = float4(0,0,0,0);
+        }
+        // Upper hull: triangle (onVertex, aVert, P)
+        TriangleOut triUp;
+        triUp.v0.pos = float4(onVertex.pos, 1.0f);
+        triUp.v1.pos = float4(aVert.pos, 1.0f);
+        triUp.v2.pos = P.pos;
+        if (_HasUV) {
+            triUp.v0.uv = float4(onVertex.uv.x, onVertex.uv.y, 0, 0);
+            triUp.v1.uv = float4(aVert.uv.x, aVert.uv.y, 0, 0);
+            triUp.v2.uv = P.uv;
+        } else {
+            triUp.v0.uv = triUp.v1.uv = triUp.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triUp.v0.norm = float4(onVertex.norm, 0);
+            triUp.v1.norm = float4(aVert.norm, 0);
+            triUp.v2.norm = P.norm;
+        } else {
+            triUp.v0.norm = triUp.v1.norm = triUp.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triUp.v0.tan = float4(onVertex.tan.xyz, onVertex.tan.w);
+            triUp.v1.tan = float4(aVert.tan.xyz, aVert.tan.w);
+            triUp.v2.tan = P.tan;
+        } else {
+            triUp.v0.tan = triUp.v1.tan = triUp.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triUp, origCross);
+        _UpperHullTriangles.Append(triUp);
+        // Lower hull: triangle (onVertex, P, bVert)
+        TriangleOut triLow;
+        triLow.v0.pos = float4(onVertex.pos, 1.0f);
+        triLow.v1.pos = P.pos;
+        triLow.v2.pos = float4(bVert.pos, 1.0f);
+        if (_HasUV) {
+            triLow.v0.uv = float4(onVertex.uv.x, onVertex.uv.y, 0, 0);
+            triLow.v1.uv = P.uv;
+            triLow.v2.uv = float4(bVert.uv.x, bVert.uv.y, 0, 0);
+        } else {
+            triLow.v0.uv = triLow.v1.uv = triLow.v2.uv = float4(0,0,0,0);
+        }
+        if (_HasNormal) {
+            triLow.v0.norm = float4(onVertex.norm, 0);
+            triLow.v1.norm = P.norm;
+            triLow.v2.norm = float4(bVert.norm, 0);
+        } else {
+            triLow.v0.norm = triLow.v1.norm = triLow.v2.norm = float4(0,0,0,0);
+        }
+        if (_HasTangent) {
+            triLow.v0.tan = float4(onVertex.tan.xyz, onVertex.tan.w);
+            triLow.v1.tan = P.tan;
+            triLow.v2.tan = float4(bVert.tan.xyz, bVert.tan.w);
+        } else {
+            triLow.v0.tan = triLow.v1.tan = triLow.v2.tan = float4(0,0,0,0);
+        }
+        PreserveWinding(triLow, origCross);
+        _LowerHullTriangles.Append(triLow);
+        // Append intersection points: the on-plane vertex and new point P
+        _IntersectionPoints.Append(onVertex.pos);
+        _IntersectionPoints.Append(P.pos.xyz);
+    }
+}
